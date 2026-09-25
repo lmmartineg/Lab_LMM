@@ -8,20 +8,25 @@ Pestañas:
   2. Similitud coseno entre frases (BoW / binario / TF-IDF / n-gramas de caracteres)
   3. Bag of Words  -> vocabulario, matriz documento-término y frecuencias
   4. Catálogo de modelos disponibles en Groq (endpoint /openai/v1/models)
-  5. Generación con distintos parámetros (temperatura, top_p, max tokens, seed,
-     stop, reasoning_effort para GPT-OSS) y comparación entre temperaturas o modelos
+  5. OCR -> extrae texto de imágenes/PDF (Groq visión o Tesseract local) y lo usa
+     como prompt para ampliar la respuesta con un LLM
+  6. Generación con distintos parámetros (temperatura, top_p, max tokens, seed,
+     stop, reasoning_effort) y comparación entre temperaturas o modelos
 
 Fuentes de referencia (verificadas en septiembre de 2026):
   - Modelos Groq:           https://console.groq.com/docs/models
   - Compatibilidad/límites: https://console.groq.com/docs/openai
-  - Razonamiento GPT-OSS:   https://console.groq.com/docs/reasoning
+  - Razonamiento:           https://console.groq.com/docs/reasoning
+  - Visión / OCR:           https://console.groq.com/docs/vision
   - API reference:          https://console.groq.com/docs/api-reference
   - tiktoken:               https://github.com/openai/tiktoken
 """
 
 from __future__ import annotations
 
+import base64
 import html
+import io
 import re
 import time
 
@@ -30,6 +35,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from PIL import Image
 from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -223,6 +229,54 @@ def is_gpt_oss(model_id: str) -> bool:
     return model_id.startswith("openai/gpt-oss")
 
 
+# Modelos con controles de razonamiento documentados (docs/reasoning, sept. 2026)
+QWEN_REASONING = {"qwen/qwen3.8-27b"}
+# Único modelo de visión listado en docs/vision (sept. 2026). Si Groq agrega otros,
+# el usuario puede escribir su ID manualmente en la pestaña OCR.
+VISION_MODELS = ["qwen/qwen3.8-27b"]
+
+
+def reasoning_family(model_id: str) -> str | None:
+    if model_id in ("openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+        return "gpt-oss"
+    if model_id in QWEN_REASONING:
+        return "qwen"
+    return None
+
+
+def reasoning_controls(models: list[str], key: str) -> dict:
+    """Muestra solo los controles de razonamiento que aplican a los modelos elegidos."""
+    fams = {reasoning_family(m) for m in models} - {None}
+    out: dict[str, dict] = {}
+    if "gpt-oss" in fams:
+        c1, c2 = st.columns(2)
+        out["gpt-oss"] = {
+            "reasoning_effort": c1.selectbox("reasoning_effort · GPT-OSS",
+                                             ["low", "medium", "high"], 1, key=f"{key}_oe"),
+            "include_reasoning": c2.checkbox("include_reasoning · GPT-OSS", True,
+                                             key=f"{key}_oi"),
+        }
+    if "qwen" in fams:
+        c1, c2 = st.columns(2)
+        out["qwen"] = {
+            "reasoning_effort": c1.selectbox(
+                "reasoning_effort · Qwen 3.8", ["none", "default", "low", "medium", "high"],
+                1, key=f"{key}_qe",
+                help="none desactiva el razonamiento; default no devuelve tokens de razonamiento."),
+            # include_reasoning y reasoning_format son mutuamente excluyentes (docs/reasoning)
+            "reasoning_format": c2.selectbox("reasoning_format · Qwen 3.8",
+                                             ["parsed", "hidden", "raw"], 0, key=f"{key}_qf"),
+        }
+    return out
+
+
+def apply_reasoning(params: dict, model: str, rc: dict) -> dict:
+    fam = reasoning_family(model)
+    if fam in rc:
+        params.update(rc[fam])
+    return params
+
+
 def generate(api_key: str, model: str, messages: list[dict], params: dict) -> dict:
     client = groq_client(api_key)
     kwargs = {k: v for k, v in params.items() if v is not None}
@@ -234,9 +288,14 @@ def generate(api_key: str, model: str, messages: list[dict], params: dict) -> di
     latency = time.perf_counter() - t0
     choice = resp.choices[0]
     usage = resp.usage.model_dump() if getattr(resp, "usage", None) else {}
+    content = choice.message.content or ""
+    reasoning = getattr(choice.message, "reasoning", None)
+    think = re.match(r"\s*<think>(.*?)</think>\s*", content, flags=re.S)
+    if think and not reasoning:  # reasoning_format="raw" mete el razonamiento en el texto
+        reasoning, content = think.group(1).strip(), content[think.end():]
     return {
-        "content": choice.message.content or "",
-        "reasoning": getattr(choice.message, "reasoning", None),
+        "content": content,
+        "reasoning": reasoning,
         "finish_reason": choice.finish_reason,
         "usage": {k: v for k, v in usage.items() if isinstance(v, (int, float))},
         "latency": latency,
@@ -275,6 +334,13 @@ ss = st.session_state
 ss.setdefault("api_ok", False)
 ss.setdefault("api_key", "")
 ss.setdefault("models", [])
+ss.setdefault("ocr_text", "")
+ss.setdefault("tok_text", "La inteligencia artificial en EAFIT: ¡tokenizar 'desafortunadamente' "
+              "cuesta más tokens que 'unfortunately'! 🤖")
+ss.setdefault("cos_text", "El gato duerme en el sofá\nEl perro duerme en la cama\n"
+              "Un felino descansa sobre el sillón\nLa bolsa de valores cayó hoy")
+ss.setdefault("bow_text", "El modelo aprende de los datos\nLos datos entrenan el modelo de "
+              "lenguaje\nEl lenguaje natural es ambiguo")
 
 with st.sidebar:
     st.header("🔑 Groq API key")
@@ -326,9 +392,9 @@ if not ss.api_ok:
     )
     st.stop()
 
-tab_tok, tab_cos, tab_bow, tab_cat, tab_gen = st.tabs(
+tab_tok, tab_cos, tab_bow, tab_cat, tab_ocr, tab_gen = st.tabs(
     ["🧩 Tokenización", "📐 Similitud coseno", "👜 Bag of Words",
-     "📚 Catálogo de modelos", "✨ Generación"]
+     "📚 Catálogo de modelos", "🖼️ OCR → Prompt", "✨ Generación"]
 )
 
 # ---------------------------------------------------------------------------
@@ -336,12 +402,7 @@ tab_tok, tab_cos, tab_bow, tab_cat, tab_gen = st.tabs(
 # ---------------------------------------------------------------------------
 with tab_tok:
     st.subheader("Esquemas de tokenización")
-    text = st.text_area(
-        "Texto a tokenizar",
-        "La inteligencia artificial en EAFIT: ¡tokenizar 'desafortunadamente' cuesta "
-        "más tokens que 'unfortunately'! 🤖",
-        height=100,
-    )
+    text = st.text_area("Texto a tokenizar", key="tok_text", height=100)
     default = [
         "Palabras + puntuación (regex)", "Caracteres (Unicode)",
         "BPE · cl100k_base (tiktoken)", "BPE · o200k_harmony (tiktoken, GPT-OSS)",
@@ -408,12 +469,7 @@ with tab_cos:
     st.subheader("Similitud coseno entre frases")
     st.latex(r"\cos(\mathbf{a},\mathbf{b})=\frac{\mathbf{a}\cdot\mathbf{b}}"
              r"{\lVert\mathbf{a}\rVert\,\lVert\mathbf{b}\rVert}")
-    raw = st.text_area(
-        "Una frase por línea",
-        "El gato duerme en el sofá\nEl perro duerme en la cama\n"
-        "Un felino descansa sobre el sillón\nLa bolsa de valores cayó hoy",
-        height=140, key="cos_text",
-    )
+    raw = st.text_area("Una frase por línea", key="cos_text", height=140)
     sents = [s.strip() for s in raw.splitlines() if s.strip()]
     c1, c2, c3 = st.columns(3)
     method = c1.radio(
@@ -493,12 +549,7 @@ SPANISH_STOP = [
 
 with tab_bow:
     st.subheader("Bag of Words")
-    raw_bow = st.text_area(
-        "Un documento por línea",
-        "El modelo aprende de los datos\nLos datos entrenan el modelo de lenguaje\n"
-        "El lenguaje natural es ambiguo",
-        height=120, key="bow_text",
-    )
+    raw_bow = st.text_area("Un documento por línea", key="bow_text", height=120)
     docs = [d.strip() for d in raw_bow.splitlines() if d.strip()]
     c1, c2, c3 = st.columns(3)
     b_lower = c1.checkbox("Minúsculas", True, key="bow_lower")
@@ -584,7 +635,261 @@ with tab_cat:
         )
 
 # ---------------------------------------------------------------------------
-# 5. Generación
+# 5. OCR -> Prompt
+# ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def tesseract_langs() -> list[str] | None:
+    """Idiomas de Tesseract si el binario está instalado; None si no está disponible."""
+    try:
+        import pytesseract
+
+        pytesseract.get_tesseract_version()
+        return [l for l in pytesseract.get_languages(config="") if l != "osd"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def pdf_page_count(data: bytes) -> int:
+    import pypdfium2 as pdfium
+
+    return len(pdfium.PdfDocument(data))
+
+
+@st.cache_data(show_spinner=False)
+def pdf_to_images(data: bytes, first: int, last: int, scale: float) -> list[Image.Image]:
+    import pypdfium2 as pdfium
+
+    pdf = pdfium.PdfDocument(data)
+    return [pdf[i].render(scale=scale).to_pil() for i in range(first - 1, last)]
+
+
+def to_data_url(img: Image.Image, max_side: int) -> str:
+    img = img.convert("RGB")
+    if max(img.size) > max_side:
+        img.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=92)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def conf_color(conf: float) -> str:
+    return "#FFADAD" if conf < 60 else "#FDFFB6" if conf < 85 else "#CAFFBF"
+
+
+def ocr_tesseract(img: Image.Image, lang: str) -> tuple[str, pd.DataFrame]:
+    import pytesseract
+
+    text = pytesseract.image_to_string(img, lang=lang)
+    data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DATAFRAME)
+    words = data[(data["conf"] >= 0) & data["text"].notna()]
+    words = words[words["text"].astype(str).str.strip() != ""][["text", "conf"]]
+    return text.strip(), words
+
+
+OCR_PROMPT = (
+    "Transcribe todo el texto visible en la imagen exactamente como aparece, respetando "
+    "los saltos de línea y el idioma original. No traduzcas, no resumas y no agregues "
+    "comentarios ni texto que no esté en la imagen. Si hay fórmulas, escríbelas en LaTeX. "
+    "Si una parte es ilegible, escribe [ilegible]. Devuelve solo el texto."
+)
+
+EXPAND_TASKS = {
+    "Explicar y ampliar": (
+        "A continuación hay un texto extraído por OCR. Explica su contenido en detalle y "
+        "amplía cada idea con definiciones, contexto y ejemplos. Distingue claramente lo que "
+        "dice el texto de lo que tú agregas como ampliación. Si detectas posibles errores de "
+        "OCR, señálalos en vez de adivinar."
+    ),
+    "Resumir": (
+        "Resume el siguiente texto extraído por OCR en 5–8 líneas, sin agregar información "
+        "que no esté en el texto."
+    ),
+    "Preguntas de estudio": (
+        "Con base únicamente en el siguiente texto extraído por OCR, genera 5 preguntas de "
+        "estudio con su respuesta. Si el texto no alcanza para responder algo, dilo."
+    ),
+    "Corregir errores de OCR": (
+        "Corrige solo errores evidentes de reconocimiento (letras cambiadas, palabras "
+        "partidas, tildes) en el siguiente texto extraído por OCR, sin cambiar su contenido. "
+        "Luego lista los cambios que hiciste."
+    ),
+    "Personalizada": "",
+}
+
+
+def _send_ocr_to(target: str):
+    lines = [l.strip() for l in ss.ocr_text.splitlines() if l.strip()]
+    if target == "tok_text":
+        ss.tok_text = ss.ocr_text
+    else:  # cos_text / bow_text: una línea no vacía = una frase/documento
+        ss[target] = "\n".join(lines)
+
+
+with tab_ocr:
+    st.subheader("OCR → texto → prompt ampliado")
+    st.caption(
+        "Paso 1: extrae texto de imágenes o PDF. Paso 2: revisa/corrige el texto. "
+        "Paso 3: úsalo como prompt para que un LLM amplíe la respuesta."
+    )
+
+    # ---- Paso 1: entrada
+    src = st.radio("Fuente", ["Subir imágenes", "Subir PDF", "Cámara"], horizontal=True)
+    images: list[tuple[str, Image.Image]] = []
+    if src == "Subir imágenes":
+        files = st.file_uploader("Imágenes (PNG, JPG, WEBP)", type=["png", "jpg", "jpeg", "webp"],
+                                 accept_multiple_files=True)
+        images = [(f.name, Image.open(f)) for f in files or []]
+    elif src == "Subir PDF":
+        pdf_file = st.file_uploader("PDF", type=["pdf"])
+        if pdf_file:
+            data = pdf_file.getvalue()
+            n = pdf_page_count(data)
+            p1, p2 = st.columns(2)
+            first, last = (p1.slider("Páginas", 1, n, (1, min(n, 3))) if n > 1 else (1, 1))
+            scale = p2.slider("Escala de render (2 ≈ 144 dpi)", 1.0, 4.0, 2.0, 0.5)
+            images = [(f"página {first + k}", im)
+                      for k, im in enumerate(pdf_to_images(data, first, last, scale))]
+    else:
+        shot = st.camera_input("Toma una foto del texto")
+        if shot:
+            images = [("cámara", Image.open(shot))]
+
+    if images:
+        st.image([im for _, im in images], caption=[n for n, _ in images], width=220)
+
+    # ---- Motor de OCR
+    langs = tesseract_langs()
+    engines = ["Groq visión (modelo multimodal)"] + (
+        ["Tesseract local (OCR clásico)"] if langs is not None else [])
+    engine = st.radio("Motor de OCR", engines, horizontal=True)
+    if langs is None:
+        st.caption(
+            "Tesseract no está instalado en este equipo, por eso solo aparece Groq. "
+            "Instalación: https://tesseract-ocr.github.io/ (en Ubuntu: "
+            "`sudo apt install tesseract-ocr tesseract-ocr-spa`)."
+        )
+
+    if engine.startswith("Groq"):
+        available = {m["id"] for m in ss.models}
+        vis = [m for m in VISION_MODELS if m in available]
+        o1, o2 = st.columns([2, 1])
+        if vis:
+            vmodel = o1.selectbox("Modelo de visión", vis + ["Otro (escribir ID)"])
+        else:
+            o1.warning("Ningún modelo de visión conocido aparece en tu catálogo.")
+            vmodel = "Otro (escribir ID)"
+        if vmodel == "Otro (escribir ID)":
+            vmodel = o1.text_input("ID del modelo de visión", VISION_MODELS[0])
+        max_side = o2.select_slider("Lado máximo de la imagen (px)",
+                                    [768, 1024, 1536, 2048, 3072], 2048)
+        ocr_prompt = st.text_area("Instrucción de OCR", OCR_PROMPT, height=110)
+        st.caption(
+            "Según docs/vision de Groq: máx. 3 imágenes por petición, cada imagen cuenta como "
+            "2048 tokens de entrada y una petición con imagen por URL no puede pasar de 20 MB. "
+            "Aquí se envía una imagen por petición (base64, JPEG)."
+        )
+    else:
+        default_lang = [l for l in ("spa", "eng") if l in langs] or langs[:1]
+        t_langs = st.multiselect("Idiomas de Tesseract", langs, default=default_lang)
+
+    if st.button("Extraer texto", type="primary", disabled=not images):
+        parts, all_words = [], []
+        prog = st.progress(0.0)
+        for k, (name, img) in enumerate(images):
+            header = f"--- {name} ---\n" if len(images) > 1 else ""
+            if engine.startswith("Groq"):
+                url = to_data_url(img, max_side)
+                if len(url) > 20 * 1024 * 1024:
+                    st.error(f"{name}: la imagen codificada supera 20 MB; reduce el lado máximo.")
+                    continue
+                msgs = [{"role": "user", "content": [
+                    {"type": "text", "text": ocr_prompt},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ]}]
+                params = {"temperature": 0.1, "max_completion_tokens": 4096}
+                if vmodel in QWEN_REASONING:
+                    params["reasoning_effort"] = "none"  # OCR no necesita razonamiento
+                res = generate(ss.api_key, vmodel, msgs, params)
+                if "error" in res:
+                    st.error(f"{name}: {res['error']}")
+                    continue
+                parts.append(header + res["content"].strip())
+                st.caption(f"{name}: {res['usage'].get('prompt_tokens')} tokens de entrada, "
+                           f"{res['usage'].get('completion_tokens')} de salida, "
+                           f"{res['latency']:.1f} s")
+            else:
+                text_k, words = ocr_tesseract(img, "+".join(t_langs) or "eng")
+                parts.append(header + text_k)
+                all_words.append((name, words))
+            prog.progress((k + 1) / len(images))
+        ss.ocr_text = "\n\n".join(parts)
+        ss.ocr_words = all_words
+
+    # Confianza por palabra (solo Tesseract)
+    for name, words in ss.get("ocr_words", []):
+        if words.empty:
+            continue
+        with st.expander(f"Confianza por palabra · {name} "
+                         f"(media {words['conf'].mean():.1f}/100)"):
+            spans = "".join(
+                f'<span class="tok" style="background:{conf_color(c)}" '
+                f'title="conf={c:.1f}">{html.escape(str(t))}<sub>{c:.0f}</sub></span>'
+                for t, c in zip(words["text"], words["conf"])
+            )
+            st.markdown(f'<div class="tok-wrap">{spans}</div>', unsafe_allow_html=True)
+            st.caption("Rojo < 60, amarillo < 85, verde ≥ 85 (confianza reportada por Tesseract).")
+
+    # ---- Paso 2: texto editable
+    st.markdown("#### Texto extraído (editable)")
+    st.text_area("Corrige aquí los errores de OCR antes de usarlo", key="ocr_text", height=220)
+    if ss.ocr_text.strip():
+        n_tokens = "—"
+        try:
+            n_tokens = len(get_tiktoken("o200k_harmony").encode(ss.ocr_text,
+                                                                 disallowed_special=()))
+        except Exception:  # noqa: BLE001
+            pass
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Caracteres", len(ss.ocr_text))
+        m2.metric("Palabras", len(ss.ocr_text.split()))
+        m3.metric("Tokens (o200k_harmony, GPT-OSS)", n_tokens)
+        b1, b2, b3, b4 = st.columns(4)
+        b1.button("→ Tokenización", on_click=_send_ocr_to, args=("tok_text",), width="stretch")
+        b2.button("→ Similitud coseno", on_click=_send_ocr_to, args=("cos_text",),
+                  width="stretch")
+        b3.button("→ Bag of Words", on_click=_send_ocr_to, args=("bow_text",), width="stretch")
+        b4.download_button("Descargar .txt", ss.ocr_text, "texto_ocr.txt", width="stretch")
+
+        # ---- Paso 3: ampliar con un LLM
+        st.markdown("#### Ampliar la respuesta usando el texto como prompt")
+        chat_ids = [m["id"] for m in ss.models if is_chat_model(m["id"])]
+        e1, e2 = st.columns([2, 1])
+        emodel = e1.selectbox(
+            "Modelo", chat_ids,
+            index=chat_ids.index("openai/gpt-oss-20b") if "openai/gpt-oss-20b" in chat_ids else 0,
+            key="ocr_model",
+        )
+        task = e2.selectbox("Tarea", list(EXPAND_TASKS))
+        instr = st.text_area("Instrucción", EXPAND_TASKS[task], key=f"ocr_instr_{task}",
+                             height=100)
+        g1, g2 = st.columns(2)
+        etemp = g1.slider("temperature", 0.0, 2.0, 0.6, 0.05, key="ocr_temp")
+        emax = g2.number_input("max_completion_tokens", 256, 65536, 4096, 256, key="ocr_max")
+        erc = reasoning_controls([emodel], key="ocr")
+        final_prompt = f"{instr.strip()}\n\n<texto_ocr>\n{ss.ocr_text.strip()}\n</texto_ocr>"
+        with st.expander("Ver el prompt final que se enviará"):
+            st.code(final_prompt, language="markdown")
+        if st.button("Ampliar respuesta", type="primary", disabled=not instr.strip()):
+            eparams = apply_reasoning({"temperature": etemp, "max_completion_tokens": int(emax)},
+                                      emodel, erc)
+            with st.spinner(f"Generando con {emodel}…"):
+                res = generate(ss.api_key, emodel,
+                               [{"role": "user", "content": final_prompt}], eparams)
+            show_result(res, f"{emodel} · {task}")
+
+# ---------------------------------------------------------------------------
+# 6. Generación
 # ---------------------------------------------------------------------------
 with tab_gen:
     st.subheader("Generación de respuestas con distintos parámetros")
@@ -628,11 +933,12 @@ with tab_gen:
     seed = c4.number_input("seed", 0, 2**31 - 1, 42, disabled=not seed_on)
     stop_txt = st.text_input("Secuencias de parada (stop), separadas por '|', máx. 4", "")
 
-    any_oss = any(is_gpt_oss(m) for m in models_sel)
-    r1, r2 = st.columns(2)
-    effort = r1.selectbox("reasoning_effort (solo GPT-OSS)", ["low", "medium", "high"],
-                          index=1, disabled=not any_oss)
-    incl_reason = r2.checkbox("include_reasoning (solo GPT-OSS)", True, disabled=not any_oss)
+    rc = reasoning_controls(models_sel, key="gen")
+    use_ocr = st.checkbox(
+        "Adjuntar el texto extraído por OCR como contexto", False,
+        disabled=not ss.ocr_text.strip(),
+        help="Se habilita cuando hay texto en la pestaña OCR → Prompt.",
+    )
 
     base = {
         "top_p": top_p,
@@ -642,14 +948,11 @@ with tab_gen:
     }
 
     def params_for(model: str, temperature: float) -> dict:
-        p = dict(base, temperature=temperature)
-        if is_gpt_oss(model):
-            p["reasoning_effort"] = effort
-            p["include_reasoning"] = incl_reason
-        return p
+        return apply_reasoning(dict(base, temperature=temperature), model, rc)
 
+    user_content = prompt + (f"\n\n<texto_ocr>\n{ss.ocr_text}\n</texto_ocr>" if use_ocr else "")
     messages = ([{"role": "system", "content": system}] if system.strip() else []) + [
-        {"role": "user", "content": prompt}
+        {"role": "user", "content": user_content}
     ]
 
     if st.button("Generar", type="primary", disabled=not prompt.strip() or not models_sel):
@@ -708,7 +1011,7 @@ with tab_gen:
             "- `presence_penalty` / `frequency_penalty`: la API reference de Groq indica que "
             "aún no los soporta ningún modelo "
             "([api-reference](https://console.groq.com/docs/api-reference)).\n"
-            "- `reasoning_format` no aplica a GPT-OSS; en su lugar se usan "
-            "`reasoning_effort` e `include_reasoning` "
+            "- `reasoning_format` no aplica a GPT-OSS (allí se usa `include_reasoning`); "
+            "en Qwen 3.8 sí aplica y es excluyente con `include_reasoning` "
             "([reasoning](https://console.groq.com/docs/reasoning))."
         )
